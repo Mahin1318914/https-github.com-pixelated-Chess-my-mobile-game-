@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+  <title>Pixel Chess (AI)</title>
+  <style>
+    html,body{margin:0;height:100%;background:#0b1020;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
+    #wrap{position:fixed;inset:0;display:flex;flex-direction:column}
+    #topbar{
+      display:flex;gap:10px;align-items:center;justify-content:space-between;
+      padding:10px 12px;background:rgba(0,0,0,.35);backdrop-filter:blur(8px)
+    }
+    #left{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    #right{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+    button,select{
+      border:0;border-radius:12px;padding:10px 12px;background:#2b5cff;color:#fff;font-weight:700
+    }
+    select{background:#18224a}
+    button.secondary{background:#18224a}
+    button.danger{background:#ff3355}
+    #status{opacity:.95;font-size:13px}
+    #boardWrap{flex:1;display:flex;align-items:center;justify-content:center;position:relative}
+    canvas{touch-action:none;border-radius:16px;box-shadow:0 12px 45px rgba(0,0,0,.45)}
+    #hint{
+      position:absolute;bottom:10px;left:50%;transform:translateX(-50%);
+      background:rgba(0,0,0,.35);padding:8px 12px;border-radius:999px;
+      font-size:12px;opacity:.9;backdrop-filter:blur(8px)
+    }
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <div id="topbar">
+    <div id="left">
+      <button id="new">New Game</button>
+      <button id="undo" class="secondary">Undo</button>
+      <button id="flip" class="secondary">Flip</button>
+      <button id="aiMove" class="secondary">AI Move</button>
+    </div>
+    <div id="right">
+      <label style="font-size:12px;opacity:.9">AI:</label>
+      <select id="aiSide">
+        <option value="b" selected>Black</option>
+        <option value="w">White</option>
+        <option value="none">Off</option>
+      </select>
+      <label style="font-size:12px;opacity:.9">Level:</label>
+      <select id="level">
+        <option value="1">1 (Fast)</option>
+        <option value="2" selected>2</option>
+        <option value="3">3 (Stronger)</option>
+      </select>
+    </div>
+  </div>
+
+  <div id="boardWrap">
+    <canvas id="c"></canvas>
+    <div id="hint">Tap a piece → tap a square. Works on mobile.</div>
+  </div>
+
+  <div id="topbar" style="justify-content:center">
+    <div id="status">Ready.</div>
+  </div>
+</div>
+
+<script>
+(() => {
+  // ===== Canvas setup =====
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const statusEl = document.getElementById("status");
+  const newBtn = document.getElementById("new");
+  const undoBtn = document.getElementById("undo");
+  const flipBtn = document.getElementById("flip");
+  const aiMoveBtn = document.getElementById("aiMove");
+  const aiSideSel = document.getElementById("aiSide");
+  const levelSel = document.getElementById("level");
+
+  let flipped = false;
+
+  function resize() {
+    const dpr = Math.max(1, Math.min(3, devicePixelRatio || 1));
+    const size = Math.floor(Math.min(innerWidth, innerHeight - 160) * 0.95);
+    const css = Math.max(280, size);
+    canvas.style.width = css + "px";
+    canvas.style.height = css + "px";
+    canvas.width = Math.floor(css * dpr);
+    canvas.height = Math.floor(css * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+  }
+  addEventListener("resize", resize, {passive:true});
+  resize();
+
+  // ===== Chess representation =====
+  const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+  function clone(obj){ return JSON.parse(JSON.stringify(obj)); }
+
+  function fenToPos(fen) {
+    const [board, turn, castling, ep, half, full] = fen.split(" ");
+    const rows = board.split("/");
+    const squares = Array(64).fill(".");
+    for (let r=0; r<8; r++){
+      let file=0;
+      for (const ch of rows[r]) {
+        if (ch >= "1" && ch <= "8") file += Number(ch);
+        else { squares[r*8 + file] = ch; file++; }
+      }
+    }
+    return { squares, turn, castling, ep, halfmove: Number(half), fullmove: Number(full) };
+  }
+
+  function idxToCoord(i){ return {r: Math.floor(i/8), f: i%8}; }
+  function coordToIdx(r,f){ return r*8+f; }
+  function inBounds(r,f){ return r>=0 && r<8 && f>=0 && f<8; }
+
+  function isWhite(p){ return p>="A" && p<="Z"; }
+  function isBlack(p){ return p>="a" && p<="z"; }
+  function sameSide(a,b){
+    if (a==="."||b===".") return false;
+    return (isWhite(a)&&isWhite(b)) || (isBlack(a)&&isBlack(b));
+  }
+
+  function algebraic(i){
+    const {r,f} = idxToCoord(i);
+    return String.fromCharCode(97+f) + String(8-r);
+  }
+  function fromAlg(s){
+    const f = s.charCodeAt(0)-97;
+    const r = 8-Number(s[1]);
+    return coordToIdx(r,f);
+  }
+
+  // ===== Move application =====
+  function updateCastling(pos, mv){
+    let c = pos.castling;
+    const fromA = algebraic(mv.from);
+    const toA = algebraic(mv.to);
+    const piece = pos.squares[mv.from];
+
+    if (piece==="K") c = c.replace("K","").replace("Q","");
+    if (piece==="k") c = c.replace("k","").replace("q","");
+
+    if (fromA==="h1") c = c.replace("K","");
+    if (fromA==="a1") c = c.replace("Q","");
+    if (fromA==="h8") c = c.replace("k","");
+    if (fromA==="a8") c = c.replace("q","");
+
+    if (toA==="h1") c = c.replace("K","");
+    if (toA==="a1") c = c.replace("Q","");
+    if (toA==="h8") c = c.replace("k","");
+    if (toA==="a8") c = c.replace("q","");
+
+    c = c.split("").filter((x,i,a)=>a.indexOf(x)===i).join("");
+    return c.length ? c : "-";
+  }
+
+  function makeMove(pos, mv){
+    const n = clone(pos);
+    const p = n.squares[mv.from];
+    const cap = n.squares[mv.to];
+
+    n.squares[mv.from] = ".";
+    n.squares[mv.to] = (mv.promo ? mv.promo : p);
+
+    if (mv.flag==="ep"){
+      const {r,f} = idxToCoord(mv.to);
+      const capR = (pos.turn==="w") ? r+1 : r-1;
+      n.squares[coordToIdx(capR,f)] = ".";
+    }
+    if (mv.flag==="castleK"){
+      if (pos.turn==="w"){ n.squares[fromAlg("h1")] = "."; n.squares[fromAlg("f1")] = "R"; }
+      else { n.squares[fromAlg("h8")] = "."; n.squares[fromAlg("f8")] = "r"; }
+    }
+    if (mv.flag==="castleQ"){
+      if (pos.turn==="w"){ n.squares[fromAlg("a1")] = "."; n.squares[fromAlg("d1")] = "R"; }
+      else { n.squares[fromAlg("a8")] = "."; n.squares[fromAlg("d8")] = "r"; }
+    }
+
+    n.castling = updateCastling(pos, mv);
+
+    n.ep = "-";
+    if (mv.flag==="pawn2"){
+      const {r,f} = idxToCoord(mv.to);
+      const epR = (pos.turn==="w") ? r+1 : r-1;
+      n.ep = algebraic(coordToIdx(epR,f));
+    }
+
+    if (p.toLowerCase()==="p" || cap !== "." || mv.flag==="ep") n.halfmove = 0;
+    else n.halfmove++;
+
+    n.turn = (pos.turn==="w") ? "b" : "w";
+    if (n.turn==="w") n.fullmove++;
+
+    return n;
+  }
+
+  // ===== Attack / check =====
+  function kingIndex(pos, side){
+    const target = side==="w" ? "K" : "k";
+    for (let i=0;i<64;i++) if (pos.squares[i]===target) return i;
+    return -1;
+  }
+
+  function isSquareAttacked(pos, sq, bySide){
+    const dirsB = [[-1,-1],[-1,1],[1,-1],[1,1]];
+    const dirsR = [[-1,0],[1,0],[0,-1],[0,1]];
+    const knight = [[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]];
+    const {r,f} = idxToCoord(sq);
+
+    // pawns
+    const pr = bySide==="w" ? r+1 : r-1;
+    for (const df of [-1,1]){
+      const rr = pr, ff = f+df;
+      if (inBounds(rr,ff)){
+        const p = pos.squares[coordToIdx(rr,ff)];
+        if (bySide==="w" && p==="P") return true;
+        if (bySide==="b" && p==="p") return true;
+      }
+    }
+
+    // knights
+    for (const [dr,df] of knight){
+      const rr = r+dr, ff = f+df;
+      if (!inBounds(rr,ff)) continue;
+      const p = pos.squares[coordToIdx(rr,ff)];
+      if (bySide==="w" && p==="N") return true;
+      if (bySide==="b" && p==="n") return true;
+    }
+
+    // diagonals
+    for (const [dr,df] of dirsB){
+      let rr=r+dr, ff=f+df;
+      while(inBounds(rr,ff)){
+        const p = pos.squares[coordToIdx(rr,ff)];
+        if (p!=="."){
+          if (bySide==="w" && (p==="B"||p==="Q")) return true;
+          if (bySide==="b" && (p==="b"||p==="q")) return true;
+          break;
+        }
+        rr+=dr; ff+=df;
+      }
+    }
+
+    // lines
+    for (const [dr,df] of dirsR){
+      let rr=r+dr, ff=f+df;
+      while(inBounds(rr,ff)){
+        const p = pos.squares[coordToIdx(rr,ff)];
+        if (p!=="."){
+          if (bySide==="w" && (p==="R"||p==="Q")) return true;
+          if (bySide==="b" && (p==="r"||p==="q")) return true;
+          break;
+        }
+        rr+=dr; ff+=df;
+      }
+    }
+
+    // kings
+    for (let dr=-1;dr<=1;dr++){
+      for (let df=-1;df<=1;df++){
+        if (!dr && !df) continue;
+        const rr=r+dr, ff=f+df;
+        if (!inBounds(rr,ff)) continue;
+        const p = pos.squares[coordToIdx(rr,ff)];
+        if (bySide==="w" && p==="K") return true;
+        if (bySide==="b" && p==="k") return true;
+      }
+    }
+    return false;
+  }
+
+  function inCheck(pos, side){
+    const k = kingIndex(pos, side);
+    if (k<0) return false;
+    const attacker = side==="w" ? "b" : "w";
+    return isSquareAttacked(pos, k, attacker);
+  }
+
+  // ===== Move generation =====
+  function addMove(pos, moves, from, to, promo=null, flag=null){
+    const piece = pos.squares[from];
+    const capture = pos.squares[to];
+    moves.push({from,to,piece,capture,promo,flag});
+  }
+
+  function canCastle(pos, side, which){
+    if (inCheck(pos, side)) return false;
+    const opp = side==="w" ? "b" : "w";
+
+    if (side==="w" && which==="K"){
+      if (pos.squares[fromAlg("f1")]!=="." || pos.squares[fromAlg("g1")]!==".") return false;
+      if (isSquareAttacked(pos, fromAlg("f1"), opp)) return false;
+      if (isSquareAttacked(pos, fromAlg("g1"), opp)) return false;
+      if (pos.squares[fromAlg("h1")]!=="R") return false;
+      return true;
+    }
+    if (side==="w" && which==="Q"){
+      if (pos.squares[fromAlg("d1")]!=="." || pos.squares[fromAlg("c1")]!=="." || pos.squares[fromAlg("b1")]!==".") return false;
+      if (isSquareAttacked(pos, fromAlg("d1"), opp)) return false;
+      if (isSquareAttacked(pos, fromAlg("c1"), opp)) return false;
+      if (pos.squares[fromAlg("a1")]!=="R") return false;
+      return true;
+    }
+    if (side==="b" && which==="K"){
+      if (pos.squares[fromAlg("f8")]!=="." || pos.squares[fromAlg("g8")]!==".") return false;
+      if (isSquareAttacked(pos, fromAlg("f8"), opp)) return false;
+      if (isSquareAttacked(pos, fromAlg("g8"), opp)) return false;
+      if (pos.squares[fromAlg("h8")]!=="r") return false;
+      return true;
+    }
+    if (side==="b" && which==="Q"){
+      if (pos.squares[fromAlg("d8")]!=="." || pos.squares[fromAlg("c8")]!=="." || pos.squares[fromAlg("b8")]!==".") return false;
+      if (isSquareAttacked(pos, fromAlg("d8"), opp)) return false;
+      if (isSquareAttacked(pos, fromAlg("c8"), opp)) return false;
+      if (pos.squares[fromAlg("a8")]!=="r") return false;
+      return true;
+    }
+    return false;
+  }
+
+  function genPawn(pos, i, moves){
+    const p = pos.squares[i];
+    const side = isWhite(p) ? "w" : "b";
+    const dir = side==="w" ? -1 : 1;
+    const {r,f} = idxToCoord(i);
+
+    const oneR = r + dir;
+    if (inBounds(oneR,f)){
+      const one = coordToIdx(oneR,f);
+      if (pos.squares[one]==="."){
+        if (oneR===0 || oneR===7){
+          addMove(pos,moves,i,one, side==="w" ? "Q" : "q");
+        } else addMove(pos,moves,i,one,null,null);
+
+        const startR = side==="w" ? 6 : 1;
+        if (r===startR){
+          const twoR = r + dir*2;
+          const two = coordToIdx(twoR,f);
+          if (pos.squares[two]===".") addMove(pos,moves,i,two,null,"pawn2");
+        }
+      }
+    }
+
+    for (const df of [-1,1]){
+      const rr = r + dir, ff = f + df;
+      if (!inBounds(rr,ff)) continue;
+      const to = coordToIdx(rr,ff);
+      const target = pos.squares[to];
+      if (target!=="." && !sameSide(p, target)){
+        if (rr===0 || rr===7) addMove(pos,moves,i,to, side==="w" ? "Q" : "q");
+        else addMove(pos,moves,i,to,null,null);
+      }
+      if (pos.ep !== "-" && algebraic(to)===pos.ep){
+        addMove(pos,moves,i,to,null,"ep");
+      }
+    }
+  }
+
+  function genKnight(pos, i, moves){
+    const p = pos.squares[i];
+    const {r,f} = idxToCoord(i);
+    const offs = [[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]];
+    for (const [dr,df] of offs){
+      const rr=r+dr, ff=f+df;
+      if (!inBounds(rr,ff)) continue;
+      const to = coordToIdx(rr,ff);
+      const t = pos.squares[to];
+      if (t==="." || !sameSide(p,t)) addMove(pos,moves,i,to,null,null);
+    }
+  }
+
+  function genSlider(pos, i, moves, dirs){
+    const p = pos.squares[i];
+    const {r,f} = idxToCoord(i);
+    for (const [dr,df] of dirs){
+      let rr=r+dr, ff=f+df;
+      while(inBounds(rr,ff)){
+        const to=coordToIdx(rr,ff);
+        const t=pos.squares[to];
+        if (t===".") addMove(pos,moves,i,to,null,null);
+        else { if (!sameSide(p,t)) addMove(pos,moves,i,to,null,null); break; }
+        rr+=dr; ff+=df;
+      }
+    }
+  }
+
+  function genKing(pos, i, moves){
+    const p = pos.squares[i];
+    const {r,f} = idxToCoord(i);
+    for (let dr=-1;dr<=1;dr++){
+      for (let df=-1;df<=1;df++){
+        if (!dr && !df) continue;
+        const rr=r+dr, ff=f+df;
+        if (!inBounds(rr,ff)) continue;
+        const to=coordToIdx(rr,ff);
+        const t=pos.squares[to];
+        if (t==="." || !sameSide(p,t)) addMove(pos,moves,i,to,null,null);
+      }
+    }
+
+    if (pos.turn==="w" && p==="K"){
+      if (pos.castling.includes("K") && canCastle(pos,"w","K")) addMove(pos,moves,fromAlg("e1"),fromAlg("g1"),null,"castleK");
+      if (pos.castling.includes("Q") && canCastle(pos,"w","Q")) addMove(pos,moves,fromAlg("e1"),fromAlg("c1"),null,"castleQ");
+    }
+    if (pos.turn==="b" && p==="k"){
+      if (pos.castling.includes("k") && canCastle(pos,"b","K")) addMove(pos,moves,fromAlg("e8"),fromAlg("g8"),null,"castleK");
+      if (pos.castling.includes("q") && canCastle(pos,"b","Q")) addMove(pos,moves,fromAlg("e8"),fromAlg("c8"),null,"castleQ");
+    }
+  }
+
+  function genMoves(pos){
+    const moves = [];
+    const turn = pos.turn;
+    for (let i=0;i<64;i++){
+      const p = pos.squares[i];
+      if (p===".") continue;
+      if (turn==="w" && !isWhite(p)) continue;
+      if (turn==="b" && !isBlack(p)) continue;
+
+      const pl = p.toLowerCase();
+      if (pl==="p") genPawn(pos,i,moves);
+      else if (pl==="n") genKnight(pos,i,moves);
+      else if (pl==="b") genSlider(pos,i,moves,[[-1,-1],[-1,1],[1,-1],[1,1]]);
+      else if (pl==="r") genSlider(pos,i,moves,[[-1,0],[1,0],[0,-1],[0,1]]);
+      else if (pl==="q") genSlider(pos,i,moves,[[-1,-1],[-1,1],[1,-1],[1,1],[-1,0],[1,0],[0,-1],[0,1]]);
+      else if (pl==="k") genKing(pos,i,moves);
+    }
+
+    // filter illegal
+    const legal = [];
+    for (const mv of moves){
+      const n = makeMove(pos,mv);
+      if (!inCheck(n, pos.turn)) legal.push(mv);
+    }
+    return legal;
+  }
+
+  // ===== Pixel sprites =====
+  const SPR = {
+    P: ["........","..####..","..####..","...##...","..####..",".######.",".######.","..####.."],
+    N: ["....##..","...####.","..##.##.","..#####.","..##....",".#####..",".######.","..####.."],
+    B: ["...##...","..####..","...##...","..####..",".######.","..####..",".######.","..####.."],
+    R: [".######.",".##..##.",".######.","...##...","...##...","..####..",".######.",".######."],
+    Q: [".##..##.",".######.","..####..",".######.",".##..##.",".######.","..####..",".######."],
+    K: ["..####..",".######.","...##...",".######.","..####..",".##..##.",".######.",".##..##."],
+  };
+
+  function drawSprite(piece, x, y, size){
+    const isW = isWhite(piece);
+    const p = piece.toUpperCase();
+    const pat = SPR[p];
+    const grid = 8;
+    const cell = Math.floor((size*0.82)/grid);
+    const ox = x + (size - cell*grid)/2;
+    const oy = y + (size - cell*grid)/2;
+
+    ctx.save();
+    ctx.imageSmoothingEnabled = false;
+
+    // shadow
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(ox+2, oy+2, cell*grid, cell*grid);
+    ctx.globalAlpha = 1;
+
+    for (let r=0;r<8;r++){
+      for (let c=0;c<8;c++){
+        if (pat[r][c] !== "#") continue;
+        ctx.fillStyle = isW ? "#f2f6ff" : "#ff7a8a";
+        ctx.fillRect(ox + c*cell, oy + r*cell, cell, cell);
+      }
+    }
+
+    ctx.globalAlpha = 0.65;
+    ctx.strokeStyle = "#0b1020";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(ox+1, oy+1, cell*grid-2, cell*grid-2);
+    ctx.restore();
+  }
+
+  // ===== UI mapping =====
+  function squareToScreen(idx){
+    const size = parseInt(canvas.style.width,10);
+    const tile = size/8;
+    let {r,f} = idxToCoord(idx);
+    if (flipped){ r = 7-r; f = 7-f; }
+    return {x:f*tile, y:r*tile, tile};
+  }
+  function screenToSquare(px,py){
+    const size = parseInt(canvas.style.width,10);
+    const tile = size/8;
+    let f = Math.floor(px/tile);
+    let r = Math.floor(py/tile);
+    if (f<0||f>7||r<0||r>7) return -1;
+    if (flipped){ r = 7-r; f = 7-f; }
+    return coordToIdx(r,f);
+  }
+  function pickSquare(clientX, clientY){
+    const rect = canvas.getBoundingClientRect();
+    return screenToSquare(clientX - rect.left, clientY - rect.top);
+  }
+
+  // ===== Game state =====
+  let pos = fenToPos(START_FEN);
+  let history = [];
+  let legalMoves = genMoves(pos);
+  let selected = -1;
+  let legalForSelected = [];
+  let lastMove = null;
+  let thinking = false;
+
+  function setStatus(msg){ statusEl.textContent = msg; }
+
+  function gameResult(posNow){
+    const moves = genMoves(posNow);
+    const side = posNow.turn;
+    if (moves.length===0){
+      if (inCheck(posNow, side)){
+        return side==="w" ? "Checkmate — Black wins" : "Checkmate — White wins";
+      }
+      return "Stalemate — Draw";
+    }
+    return null;
+  }
+
+  function updateStatusAuto(){
+    const res = gameResult(pos);
+    if (res){ setStatus(res); return; }
+    const sideName = pos.turn==="w" ? "White" : "Black";
+    const chk = inCheck(pos,pos.turn) ? " (Check!)" : "";
+    setStatus(`${sideName} to move${chk}`);
+  }
+
+  function updateSelection(){
+    legalMoves = genMoves(pos);
+    if (selected>=0){
+      const p = pos.squares[selected];
+      const isOwn = (pos.turn==="w" && isWhite(p)) || (pos.turn==="b" && isBlack(p));
+      if (!isOwn){
+        selected = -1;
+        legalForSelected = [];
+      } else {
+        legalForSelected = legalMoves.filter(m=>m.from===selected);
+      }
+    } else legalForSelected = [];
+  }
+
+  function tryMove(toSq){
+    if (selected<0) return false;
+    const mv = legalForSelected.find(m=>m.to===toSq);
+    if (!mv) return false;
+    history.push(clone(pos));
+    pos = makeMove(pos, mv);
+    lastMove = mv;
+    selected = -1;
+    legalForSelected = [];
+    legalMoves = genMoves(pos);
+    updateStatusAuto();
+    draw();
+    maybeAIMove();
+    return true;
+  }
+
+  // ===== Draw =====
+  function draw(){
+    const size = parseInt(canvas.style.width,10);
+    const tile = size/8;
+
+    // background
+    ctx.clearRect(0,0,size,size);
+    const g = ctx.createLinearGradient(0,0,0,size);
+    g.addColorStop(0,"#0b1020");
+    g.addColorStop(1,"#081430");
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,size,size);
+
+    // board
+    for (let r=0;r<8;r++){
+      for (let f=0;f<8;f++){
+        const rr = flipped ? 7-r : r;
+        const ff = flipped ? 7-f : f;
+        const idx = coordToIdx(rr,ff);
+
+        const light = ((r+f)%2===0);
+        ctx.fillStyle = light ? "#d9e2ff" : "#2a3b7a";
+        ctx.fillRect(f*tile, r*tile, tile, tile);
+
+        if (lastMove && (idx===lastMove.from || idx===lastMove.to)){
+          ctx.fillStyle = "rgba(255,215,0,0.28)";
+          ctx.fillRect(f*tile, r*tile, tile, tile);
+        }
+
+        if (idx===selected){
+          ctx.fillStyle = "rgba(43,92,255,0.35)";
+          ctx.fillRect(f*tile, r*tile, tile, tile);
+        }
+
+        if (selected>=0 && legalForSelected.some(m=>m.to===idx)){
+          ctx.fillStyle = "rgba(0,0,0,0.22)";
+          ctx.beginPath();
+          ctx.arc(f*tile + tile/2, r*tile + tile/2, tile*0.12, 0, Math.PI*2)
